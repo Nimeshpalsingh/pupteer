@@ -1,0 +1,84 @@
+const express = require('express');
+const cors = require('cors');
+const puppeteer = require('puppeteer');
+const { URL } = require('url');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+async function getImageUrls(query, startIndex = 0, chunkSize = 10) {
+    const browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    const page = await browser.newPage();
+
+    query = query.replace(' ', '+');
+    const searchUrl = `https://yandex.com/images/search?text=${query}`;
+
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded' });
+
+    let imageUrls = [];
+
+    function timeout(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    try {
+        await page.waitForSelector('.SerpItem', { timeout: 500 });
+        let lastHeight = await page.evaluate('document.body.scrollHeight');
+
+        while (imageUrls.length < startIndex + chunkSize) {
+            let newImageUrls = await page.evaluate(() => {
+                let items = Array.from(document.querySelectorAll('.SerpItem'));
+                return items.map(item => {
+                    let thumbnail = item.querySelector('img').src;
+                    let link = item.querySelector('a').href;
+                    let original = new URL(link).searchParams.get('img_url');
+                    return {
+                        thumbnail_url: thumbnail,
+                        original_url: original || "N/A"
+                    };
+                });
+            });
+
+            imageUrls = [...imageUrls, ...newImageUrls];
+            imageUrls = [...new Map(imageUrls.map(item => [item['original_url'], item])).values()]; // Remove duplicates
+
+            await page.evaluate('window.scrollTo(0, document.body.scrollHeight)');
+            await timeout(1000); // Custom timeout function
+
+            let newHeight = await page.evaluate('document.body.scrollHeight');
+            if (newHeight === lastHeight) break;
+            lastHeight = newHeight;
+        }
+    } catch (e) {
+        console.log(`Error: ${e.message}`);
+    }
+
+    await browser.close();
+    return imageUrls.slice(startIndex, startIndex + chunkSize);
+}
+
+app.post('/api_img_search', async (req, res) => {
+    const { query, start_index, chunk_size } = req.body;
+    if (!query) {
+        return res.status(400).json({ error: "Query parameter 'query' is required." });
+    }
+
+    const startIndex = start_index || 0;
+    const chunkSize = chunk_size || 10;
+    const imageData = await getImageUrls(query, startIndex, chunkSize);
+
+    if (imageData.length) {
+        res.json({ images: imageData });
+    } else {
+        res.json({ message: "No images found for the query." });
+    }
+});
+
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+});
